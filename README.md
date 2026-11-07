@@ -167,10 +167,4 @@ Distributed under the **MIT License**. See `LICENSE` for more information.
 
 ---
 
-## 👨‍💻 Author & Acknowledgments
-
-**Built by:** [Your Name]  
-**Role:** Project Lead & Architect (Team of 4)  
-**Context:** Designed to demonstrate end-to-end Digital Transformation workflow: **Ideation → Governance → Secure Execution → Impact Measurement**.
-
 *Inspired by real-world challenges in manufacturing, logistics, and service industries where frontline staff need a voice in automation.*
