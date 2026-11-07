@@ -1,16 +1,15 @@
-import os, sqlite3, subprocess, tempfile, time
+import os, sqlite3, subprocess, tempfile, time, ast
 from flask import Flask, request, render_template_string, redirect, url_for
 
 app = Flask(__name__)
 DB = os.path.join(os.path.dirname(__file__), "dx_quest.db")
 
 # ---------------------------------------------------------------------
-# Initialise SQLite schema
+# DB Initialization
 # ---------------------------------------------------------------------
 def init_db():
     with sqlite3.connect(DB) as con:
-        cur = con.cursor()
-        cur.executescript("""
+        con.executescript("""
         CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
         CREATE TABLE IF NOT EXISTS challenges (
             id INTEGER PRIMARY KEY,
@@ -40,24 +39,21 @@ def init_db():
             completed_at TEXT DEFAULT (datetime('now'))
         );
         """)
-
-        # Migrations for status columns if they don't exist
+        # Migrations
         try:
-            cur.execute("SELECT status FROM challenges LIMIT 1")
+            con.execute("SELECT status FROM challenges LIMIT 1")
         except sqlite3.OperationalError:
-            cur.execute("ALTER TABLE challenges ADD COLUMN status TEXT CHECK(status IN ('pending', 'approved', 'rejected')) DEFAULT 'approved'")
-            cur.execute("ALTER TABLE challenges ADD COLUMN admin_feedback TEXT")
-
+            con.execute("ALTER TABLE challenges ADD COLUMN status TEXT DEFAULT 'approved'")
+            con.execute("ALTER TABLE challenges ADD COLUMN admin_feedback TEXT")
         con.commit()
 init_db()
 
 # ---------------------------------------------------------------------
-# DB Helpers
+# Helpers
 # ---------------------------------------------------------------------
 def q(sql, args=()):
     with sqlite3.connect(DB) as con:
-        cur = con.execute(sql, args)
-        return cur.fetchall()
+        return con.execute(sql, args).fetchall()
 
 def exec_sql(sql, args=()):
     with sqlite3.connect(DB) as con:
@@ -72,8 +68,15 @@ def get_demo_user():
 
 DEMO_USER_ID = get_demo_user()
 
+def check_syntax(code):
+    try:
+        ast.parse(code)
+        return True, "Syntax OK"
+    except SyntaxError as e:
+        return False, f"Syntax Error at line {e.lineno}: {e.msg}"
+
 # ---------------------------------------------------------------------
-# UI Layout Template
+# LAYOUT with CodeMirror
 # ---------------------------------------------------------------------
 LAYOUT = """
 <!DOCTYPE html>
@@ -81,9 +84,11 @@ LAYOUT = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quest it here - DX Platform</title>
+    <title>Quest it here</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.0/codemirror.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.0/theme/dracula.min.css">
     <style>
         body { background-color: #f4f7f6; font-family: 'Inter', system-ui, -apple-system, sans-serif; }
         .navbar { background-color: #1a2a3a !important; border-bottom: 3px solid #3498db; }
@@ -92,20 +97,18 @@ LAYOUT = """
         .btn-success { background-color: #27ae60; border: none; }
         .sidebar-heading { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: #7f8c8d; font-weight: 700; margin-bottom: 1rem; }
         .nav-pills .nav-link { border-radius: 10px; color: #2c3e50; font-weight: 500; margin-bottom: 5px; }
-        .nav-pills .nav-link.active { background-color: #3498db; }
+        .nav-pills .nav-link.active { background-color: #3498db; color: white; }
         .nav-pills .nav-link:hover:not(.active) { background-color: #ecf0f1; }
-        .status-pill { padding: 4px 12px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
         .diff-1 { color: #27ae60; } .diff-2 { color: #f1c40f; } .diff-3 { color: #e67e22; } .diff-4 { color: #e74c3c; } .diff-5 { color: #8e44ad; }
-        .code-editor { font-family: 'Fira Code', 'Courier New', monospace; font-size: 14px; background-color: #2d3436; color: #dfe6e9; border-radius: 10px; padding: 20px; }
+        .CodeMirror { height: 350px; border-radius: 10px; font-size: 14px; }
+        .stats-card { background: linear-gradient(135deg, #6a11cb 0%, #2575fc 100%); color: white; }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark sticky-top">
         <div class="container-fluid px-4">
             <a class="navbar-brand fw-bold fs-4" href="{{url_for('home')}}"><i class="bi bi-rocket-takeoff-fill me-2 text-info"></i>Quest it here</a>
-            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-                <span class="navbar-toggler-icon"></span>
-            </button>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav"><span class="navbar-toggler-icon"></span></button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav ms-auto align-items-center">
                     <li class="nav-item me-3"><span class="text-light opacity-50 small">Welcome, User</span></li>
@@ -117,7 +120,7 @@ LAYOUT = """
 
     <div class="container-fluid">
         <div class="row">
-            <!-- Global Sidebar -->
+            <!-- Sidebar -->
             <nav class="col-md-3 col-lg-2 d-md-block bg-white sidebar collapse border-end min-vh-100 p-4">
                 <div class="position-sticky">
                     <div class="sidebar-heading mt-2">Workspace</div>
@@ -125,7 +128,6 @@ LAYOUT = """
                         <li class="nav-item"><a class="nav-link {{'active' if active_page=='user'}}" href="{{url_for('user_dashboard')}}"><i class="bi bi-person-workspace me-2"></i>User Portal</a></li>
                         <li class="nav-item"><a class="nav-link {{'active' if active_page=='board'}}" href="{{url_for('list_challenges')}}"><i class="bi bi-kanban me-2"></i>Quest Board</a></li>
                     </ul>
-
                     <div class="sidebar-heading">Management</div>
                     <ul class="nav nav-pills flex-column">
                         <li class="nav-item"><a class="nav-link {{'active' if active_page=='admin'}}" href="{{url_for('admin_dashboard')}}"><i class="bi bi-shield-lock me-2 text-danger"></i>Admin Hub</a></li>
@@ -133,25 +135,38 @@ LAYOUT = """
                 </div>
             </nav>
 
-            <!-- Main Content Area -->
+            <!-- Main Content -->
             <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4 py-4">
                 {% block content %}{% endblock %}
             </main>
         </div>
     </div>
 
-    <footer class="text-center py-4 mt-5 text-muted border-top">
-        <small>&copy; Quest it here - DX Initiatives Platform</small>
-    </footer>
+    <footer class="text-center py-4 mt-5 text-muted border-top"><small>&copy; Quest it here - DX Platform</small></footer>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.0/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.0/mode/python/python.min.js"></script>
+    <script>
+        // Initialize CodeMirror on any textarea with id="code"
+        document.addEventListener('DOMContentLoaded', function() {
+            var textarea = document.getElementById("code");
+            if (textarea) {
+                window.editor = CodeMirror.fromTextArea(textarea, {
+                    mode: "python", theme: "dracula", lineNumbers: true, indentUnit: 4, tabSize: 4
+                });
+                // Sync textarea before form submit
+                var form = textarea.form;
+                if(form) form.addEventListener('submit', function(){ window.editor.save(); });
+            }
+        });
+    </script>
 </body>
 </html>
 """
 
 # ---------------------------------------------------------------------
-# Pages
+# Routes
 # ---------------------------------------------------------------------
-
 @app.route('/')
 def home():
     return redirect(url_for('user_dashboard'))
@@ -161,10 +176,12 @@ def user_dashboard():
     my_requests = q("SELECT id, title, status, created_at FROM challenges WHERE submitter_id=? ORDER BY created_at DESC", (DEMO_USER_ID,))
     active_claims = q("""
         SELECT cl.id, ch.title, ch.difficulty, cl.claimed_at
-        FROM claims cl
-        JOIN challenges ch ON cl.challenge_id = ch.id
+        FROM claims cl JOIN challenges ch ON cl.challenge_id = ch.id
         WHERE cl.claimant_id = ? AND cl.status = 'open'
     """, (DEMO_USER_ID,))
+
+    total_pts = q("SELECT SUM(points) FROM completions JOIN claims ON completions.claim_id = claims.id WHERE claims.claimant_id=?", (DEMO_USER_ID,))[0][0] or 0
+    total_done = q("SELECT COUNT(*) FROM completions JOIN claims ON completions.claim_id = claims.id WHERE claims.claimant_id=?", (DEMO_USER_ID,))[0][0]
 
     content = f"""
     <div class="d-flex justify-content-between align-items-center mb-4">
@@ -173,7 +190,6 @@ def user_dashboard():
     </div>
 
     <div class="row">
-        <!-- Left: My Active Quests -->
         <div class="col-lg-7">
             <div class="card p-4">
                 <h5 class="fw-bold mb-3"><i class="bi bi-hammer me-2 text-primary"></i>My Active Quests (Solving Now)</h5>
@@ -182,9 +198,9 @@ def user_dashboard():
                     <div class="list-group-item d-flex justify-content-between align-items-center px-0 py-3">
                         <div>
                             <h6 class="mb-1 fw-bold">{r[1]}</h6>
-                            <small class="text-muted">Claimed: {r[3]}</small>
+                            <small class="text-muted">Claimed: {r[3]} | Difficulty: Lvl {r[2]}</small>
                         </div>
-                        <a href="{url_for('upload_solution', claim_id=r[0])}" class="btn btn-sm btn-success">Upload Script</a>
+                        <a href="{url_for('upload_solution', claim_id=r[0])}" class="btn btn-sm btn-success">Open Editor</a>
                     </div>''' for r in active_claims) or '<p class="text-muted py-3">No active quests. Go to the Quest Board to claim one!</p>'}
                 </div>
             </div>
@@ -207,15 +223,13 @@ def user_dashboard():
             </div>
         </div>
 
-        <!-- Right: Board Quick Look -->
         <div class="col-lg-5">
             <div class="card p-4 bg-light border">
-                <h5 class="fw-bold mb-3">Community Hub</h5>
-                <p class="small text-muted">Ready to earn points? The Quest Board has approved ideas waiting for a developer.</p>
-                <a href="{{{{url_for('list_challenges')}}}}" class="btn btn-outline-primary w-100 mb-3">Go to Quest Board</a>
+                <h5 class="fw-bold mb-3">My Impact Stats</h5>
+                <div class="d-flex justify-content-between mb-2"><span>Total Impact Points:</span> <span class="fw-bold text-primary fs-5">{total_pts}</span></div>
+                <div class="d-flex justify-content-between mb-2"><span>Quests Completed:</span> <span class="fw-bold text-success fs-5">{total_done}</span></div>
                 <hr>
-                <div class="d-flex justify-content-between mb-2"><span>Points Earned:</span> <span class="fw-bold text-primary">{q("SELECT SUM(points) FROM completions JOIN claims ON completions.claim_id = claims.id WHERE claims.claimant_id=?", (DEMO_USER_ID,))[0][0] or 0}</span></div>
-                <div class="d-flex justify-content-between"><span>Quests Finished:</span> <span class="fw-bold text-success">{q("SELECT COUNT(*) FROM completions JOIN claims ON completions.claim_id = claims.id WHERE claims.claimant_id=?", (DEMO_USER_ID,))[0][0]}</span></div>
+                <a href="{{{{url_for('list_challenges')}}}}" class="btn btn-outline-primary w-100"><i class="bi bi-kanban me-1"></i> Browse Quest Board</a>
             </div>
         </div>
     </div>
@@ -228,16 +242,13 @@ def list_challenges():
         SELECT ch.id, ch.title, ch.description, ch.baseline_minutes, ch.difficulty,
                (SELECT COUNT(*) FROM claims cl WHERE cl.challenge_id=ch.id AND cl.status='open') AS is_claimed,
                (SELECT COUNT(*) FROM claims cl WHERE cl.challenge_id=ch.id AND cl.status='completed') AS is_done
-        FROM challenges ch
-        WHERE ch.status = 'approved'
-        ORDER BY ch.created_at DESC
+        FROM challenges ch WHERE ch.status = 'approved' ORDER BY ch.created_at DESC
     """)
 
     cards = ""
     for r in rows:
         status_info = '<span class="text-success small fw-bold">AVAILABLE</span>'
-        action_btn = f'<a href="{url_for("claim", cid=r[0])}" class="btn btn-sm btn-primary px-4 rounded-pill">Claim</a>'
-
+        action_btn = f'<a href="{url_for("claim", cid=r[0])}" class="btn btn-sm btn-primary px-4 rounded-pill">Claim Quest</a>'
         if r[6]:
             status_info = '<span class="text-muted small">RESOLVED</span>'
             action_btn = '<span class="badge bg-secondary rounded-pill p-2"><i class="bi bi-check-lg"></i> Done</span>'
@@ -269,7 +280,7 @@ def list_challenges():
 
     content = f"""
     <h2 class="fw-bold mb-4"><i class="bi bi-kanban me-2 text-primary"></i>Quest Board</h2>
-    <div class="row">{cards or '<div class="col-12 text-center py-5">No quests available yet.</div>'}</div>
+    <div class="row">{cards or '<div class="col-12 text-center py-5">No approved quests available yet.</div>'}</div>
     """
     return render_template_string(LAYOUT.replace("{% block content %}{% endblock %}", content), active_page='board')
 
@@ -304,23 +315,14 @@ def admin_dashboard():
     <div class="d-flex justify-content-between align-items-center mb-4">
         <h2 class="fw-bold text-danger"><i class="bi bi-shield-lock-fill me-2"></i>Admin Hub</h2>
         <div class="d-flex gap-4">
-            <div class="text-end">
-                <div class="small text-muted text-uppercase">Total Submissions</div>
-                <div class="fw-bold fs-4">{total_req}</div>
-            </div>
-            <div class="text-end border-start ps-4">
-                <div class="small text-muted text-uppercase">Approved Quests</div>
-                <div class="fw-bold fs-4 text-success">{total_app}</div>
-            </div>
+            <div class="text-end"><div class="small text-muted text-uppercase">Total Submissions</div><div class="fw-bold fs-4">{total_req}</div></div>
+            <div class="text-end border-start ps-4"><div class="small text-muted text-uppercase">Approved Quests</div><div class="fw-bold fs-4 text-success">{total_app}</div></div>
         </div>
     </div>
-
-    <div class="row">
-        <div class="col-md-9">
-            <h5 class="fw-bold mb-3">Pending Review Queue</h5>
-            {rows or '<div class="alert alert-light border text-center py-5">Review queue is empty. Good job, Admin!</div>'}
-        </div>
-    </div>
+    <div class="row"><div class="col-md-9">
+        <h5 class="fw-bold mb-3">Pending Review Queue</h5>
+        {rows or '<div class="alert alert-light border text-center py-5">Review queue is empty. Good job, Admin!</div>'}
+    </div></div>
     """
     return render_template_string(LAYOUT.replace("{% block content %}{% endblock %}", content), active_page='admin')
 
@@ -346,29 +348,15 @@ def new_challenge():
                 <h3 class="fw-bold mb-2">Request DX Automation</h3>
                 <p class="text-muted mb-4">Submit your idea for automation or AI integration. The Planning Group will review it for the Quest Board.</p>
                 <form method="post">
-                    <div class="mb-4">
-                        <label class="form-label fw-bold">Project Name</label>
-                        <input name="title" class="form-control form-control-lg" placeholder="e.g. Automated Receipt Scanner" required>
-                    </div>
-                    <div class="mb-4">
-                        <label class="form-label fw-bold">What needs to be automated?</label>
-                        <textarea name="desc" class="form-control" rows="4" placeholder="Describe the manual work, data sources, and desired AI/automation outcome..." required></textarea>
-                    </div>
+                    <div class="mb-4"><label class="form-label fw-bold">Project Name</label><input name="title" class="form-control form-control-lg" placeholder="e.g. Automated Receipt Scanner" required></div>
+                    <div class="mb-4"><label class="form-label fw-bold">What needs to be automated?</label><textarea name="desc" class="form-control" rows="4" placeholder="Describe the manual work, data sources, and desired AI/automation outcome..." required></textarea></div>
                     <div class="row mb-5">
-                        <div class="col-md-6">
-                            <label class="form-label fw-bold">Manual Effort (mins/task)</label>
-                            <input type="number" name="base" class="form-control" min="1" value="30" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label fw-bold">Complexity Level</label>
+                        <div class="col-md-6"><label class="form-label fw-bold">Manual Effort (mins/task)</label><input type="number" name="base" class="form-control" min="1" value="30" required></div>
+                        <div class="col-md-6"><label class="form-label fw-bold">Complexity Level</label>
                             <select name="diff" class="form-select">
-                                <option value="1">1 - Simple Task</option>
-                                <option value="2">2 - Multi-step Automation</option>
-                                <option value="3" selected>3 - Data/API Integration</option>
-                                <option value="4">4 - Advanced AI/ML</option>
-                                <option value="5">5 - Enterprise Strategy</option>
-                            </select>
-                        </div>
+                                <option value="1">1 - Simple Task</option><option value="2">2 - Multi-step Automation</option>
+                                <option value="3" selected>3 - Data/API Integration</option><option value="4">4 - Advanced AI/ML</option><option value="5">5 - Enterprise Strategy</option>
+                            </select></div>
                     </div>
                     <button type="submit" class="btn btn-primary btn-lg w-100 shadow">Submit Request for Approval</button>
                 </form>
@@ -392,16 +380,33 @@ def upload_solution(claim_id):
     title, baseline, diff = chal[0]
 
     if request.method == 'POST':
+        # CodeMirror saves to hidden textarea, so we read from form['script']
         script = request.form['script']
+
+        # 1. SYNTAX CHECK
+        valid, msg = check_syntax(script)
+        if not valid:
+            return f"""
+            <div class="container text-center py-5">
+                <h1 class="display-1 text-danger">⛔</h1>
+                <h2 class="fw-bold">Syntax Check Failed</h2>
+                <div class="alert alert-danger text-start mx-auto w-75"><code>{msg}</code></div>
+                <a href="{url_for('upload_solution', claim_id=claim_id)}" class="btn btn-primary mt-3">Fix Code</a>
+            </div>
+            """
+
+        # 2. RUN IN SANDBOX
         with tempfile.TemporaryDirectory() as td:
             script_path = os.path.join(td, "solution.py")
             with open(script_path, "w", encoding="utf-8") as f: f.write(script)
             start = time.time()
             try:
                 proc = subprocess.run(["python", "-I", "solution.py"], cwd=td, capture_output=True, text=True, timeout=30)
-                status, output = "SUCCESS", proc.stdout + (proc.stderr or "")
+                output = proc.stdout + (proc.stderr or "")
+            except subprocess.TimeoutExpired:
+                output = "ERROR: Execution timed out (30s limit)."
             except Exception as e:
-                status, output = "ERROR", str(e)
+                output = f"ERROR: {e}"
             elapsed = int((time.time() - start) * 1000)
 
         saved = max(0, baseline - int(elapsed/1000/60))
@@ -410,37 +415,66 @@ def upload_solution(claim_id):
                  (claim_id, script, output, elapsed, points))
         exec_sql("UPDATE claims SET status='completed' WHERE id=?", (claim_id,))
 
-        return f"""
-        <div class="text-center py-5">
-            <h1 class="display-1">🔥</h1>
-            <h2 class="display-4 fw-bold">Quest Complete!</h2>
-            <p class="lead">System verified. You earned <strong>{points}</strong> impact points.</p>
-            <div class="container text-start mt-5"><pre class="code-editor">{output}</pre></div>
-            <a href="{url_for('user_dashboard')}" class="btn btn-primary btn-lg mt-4">Return to Workspace</a>
+        # Success Page - Uses full LAYOUT for consistency
+        success_content = f"""
+        <div class="row justify-content-center">
+            <div class="col-md-9">
+                <div class="card p-5 shadow-lg border-0">
+                    <div class="text-center mb-4">
+                        <div class="bg-success bg-opacity-10 text-success rounded-circle d-inline-flex align-items-center justify-content-center mb-3" style="width: 80px; height: 80px;">
+                            <i class="bi bi-check2-all fs-1"></i>
+                        </div>
+                        <h1 class="display-4 fw-bold">Quest Complete!</h1>
+                        <p class="lead text-muted">Automation verified and deployed successfully.</p>
+                    </div>
+
+                    <div class="row mb-4">
+                        <div class="col-md-6 text-center p-3 bg-light rounded-3">
+                            <div class="fs-4 fw-bold text-primary">{points}</div>
+                            <div class="text-muted small">Impact Points Earned</div>
+                        </div>
+                        <div class="col-md-6 text-center p-3 bg-light rounded-3">
+                            <div class="fs-4 fw-bold text-success">{saved} min</div>
+                            <div class="text-muted small">Time Saved per Task</div>
+                        </div>
+                    </div>
+
+                    <hr class="my-4">
+                    <h5 class="fw-bold mb-3"><i class="bi bi-terminal me-2"></i>Execution Log</h5>
+                    <div class="code-editor bg-dark text-light p-3 rounded" style="font-family: monospace; white-space: pre-wrap; max-height: 300px; overflow-y: auto;">
+{output if output.strip() else "(No output printed)"}
+                    </div>
+
+                    <div class="text-center mt-4">
+                        <a href="{url_for('user_dashboard')}" class="btn btn-primary btn-lg px-5"><i class="bi bi-house-door me-1"></i> Back to Workspace</a>
+                    </div>
+                </div>
+            </div>
         </div>
         """
+        return render_template_string(LAYOUT.replace("{% block content %}{% endblock %}", success_content), active_page='user')
 
     content = f"""
     <div class="row justify-content-center">
         <div class="col-md-10">
             <div class="card p-5">
                 <h3 class="fw-bold mb-4">Solving: {title}</h3>
+                <p class="text-muted">Write your Python automation script. The system will validate syntax before execution.</p>
                 <form method="post">
-                    <div class="mb-3">
-                        <label class="form-label text-muted">Upload your DX Automation Script (Python)</label>
-                        <textarea name="script" class="form-control code-editor" rows="15" required># DX Solution Script Template
+                    <div class="mb-3"><label class="form-label text-muted">Python Solution</label>
+                        <textarea id="code" name="script" rows="15" required># DX Solution Template
 import sys
 
 def main():
     print("Initializing DX Agent...")
-    # Add your logic here
+    # Your logic here
     print("Automation successful.")
 
 if __name__ == '__main__':
     main()</textarea>
                     </div>
                     <div class="d-flex justify-content-between align-items-center">
-                        <div class="text-muted small"><i class="bi bi-info-circle me-1"></i>Runtime limit: 30s | Isolated Env</div>
+                        <div class="text-muted small"><i class="bi bi-info-circle me-1"></i>Runtime limit: 30s | Isolated Env | Syntax Checked on Submit</div>
                         <button type="submit" class="btn btn-success btn-lg px-5">Verify & Submit</button>
                     </div>
                 </form>
@@ -454,11 +488,8 @@ if __name__ == '__main__':
 def leaderboard():
     rows = q("""
         SELECT u.name, SUM(c.points) AS pts, COUNT(c.id) AS completed
-        FROM completions c
-        JOIN claims cl ON c.claim_id = cl.id
-        JOIN users u ON cl.claimant_id = u.id
-        GROUP BY u.id
-        ORDER BY pts DESC
+        FROM completions c JOIN claims cl ON c.claim_id = cl.id JOIN users u ON cl.claimant_id = u.id
+        GROUP BY u.id ORDER BY pts DESC
     """)
     table_rows = "".join(f"<tr><td class='fw-bold'>#{i}</td><td>{r[0]}</td><td><span class='badge bg-primary px-3'>{r[1]}</span></td><td>{r[2]} Quests</td></tr>" for i, r in enumerate(rows, 1))
 
